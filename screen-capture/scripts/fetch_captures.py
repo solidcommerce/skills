@@ -403,7 +403,9 @@ def build_authorization_payload(payload, resumed=False):
     link_code = str(payload.get('userCode') or '')
     expires_at = str(payload.get('expiresAt') or '')
     status_value = str(payload.get('status') or '').strip()
-    if status_value == 'awaiting_device':
+    if status_value == 'expired':
+        message = 'Your last VCapture link expired. Open the new authorizeUrl to reconnect.'
+    elif status_value == 'awaiting_device':
         message = 'Account approved. Keep VCapture running for a few seconds, then retry the screen-capture request.'
     elif resumed:
         message = 'Finish the open VCapture connection flow, then retry the screen-capture request.'
@@ -487,6 +489,13 @@ def ensure_skill_access(api_base_url, access_token, token_source, wait_for_link_
             save_content_key(unwrap_content_key(result, pending), api_base_url)
             clear_pending_link()
             return save_access_token(result, api_base_url)
+        if result and result.get('status') == 'expired':
+            clear_pending_link()
+            fresh_pending = start_link_session(api_base_url)
+            raise AuthorizationRequired(build_authorization_payload({
+                **fresh_pending,
+                'status': 'expired'
+            }, resumed=False))
         raise AuthorizationRequired(build_authorization_payload({
             **pending,
             **(result or {})
