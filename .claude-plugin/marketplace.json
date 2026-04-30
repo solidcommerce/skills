@@ -1,0 +1,22 @@
+{
+  "name": "solidcommerce",
+  "owner": {
+    "name": "Solid Commerce"
+  },
+  "metadata": {
+    "description": "Solid Commerce plugins for Claude Code, including VCapture screen access.",
+    "version": "1.0.0",
+    "pluginRoot": "./plugins"
+  },
+  "plugins": [
+    {
+      "name": "vcapture",
+      "source": "./plugins/vcapture",
+      "description": "View the user's latest screen through VCapture and help debug visible UI issues.",
+      "version": "1.0.0",
+      "author": {
+        "name": "Solid Commerce"
+      }
+    }
+  ]
+}
