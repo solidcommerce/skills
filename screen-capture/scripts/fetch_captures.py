@@ -4,6 +4,7 @@
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -34,6 +35,10 @@ DEFAULT_ACCESS_TOKEN_FILE = DEFAULT_STATE_DIR / 'skill-token'
 DEFAULT_ACCESS_TOKEN_METADATA_FILE = DEFAULT_STATE_DIR / 'skill-token.json'
 DEFAULT_CONTENT_KEY_FILE = DEFAULT_STATE_DIR / 'content-key.json'
 DEFAULT_LINK_SESSION_FILE = DEFAULT_STATE_DIR / 'skill-link.json'
+DEFAULT_UPDATE_STATE_FILE = DEFAULT_STATE_DIR / 'skill-update.json'
+DEFAULT_UPDATE_INTERVAL_SECONDS = 12 * 60 * 60
+DEFAULT_WINDOWS_DOWNLOAD_URL = 'https://vcapture.takeoffcommerce.com/download/windows'
+DEFAULT_MAC_DOWNLOAD_URL = 'https://vcapture.takeoffcommerce.com/download/mac'
 
 
 class ApiError(RuntimeError):
@@ -46,6 +51,10 @@ class AuthorizationRequired(RuntimeError):
     def __init__(self, payload):
         super().__init__(payload.get('message') or 'VCapture authorization is required.')
         self.payload = payload
+
+
+class NoCapturesError(RuntimeError):
+    pass
 
 
 def trim_trailing_slash(value):
@@ -145,6 +154,29 @@ def get_default_source_id(cli_value):
     return str(value or '').strip()
 
 
+def get_download_links():
+    return {
+        'windows': get_env('VCAPTURE_WINDOWS_DOWNLOAD_URL', 'AVCAPTURE_WINDOWS_DOWNLOAD_URL') or DEFAULT_WINDOWS_DOWNLOAD_URL,
+        'mac': get_env('VCAPTURE_MAC_DOWNLOAD_URL', 'AVCAPTURE_MAC_DOWNLOAD_URL') or DEFAULT_MAC_DOWNLOAD_URL,
+    }
+
+
+def attach_download_links(payload):
+    next_payload = dict(payload or {})
+    next_payload['download_links'] = get_download_links()
+    next_payload['download_hint'] = (
+        'If VCapture is not installed or not running on the capture machine, install the desktop app first.'
+    )
+    return next_payload
+
+
+def auto_update_enabled():
+    value = get_env('VCAPTURE_SKILL_AUTO_UPDATE', 'AVCAPTURE_SKILL_AUTO_UPDATE')
+    if not value:
+        return True
+    return str(value).strip().lower() not in {'0', 'false', 'no', 'off'}
+
+
 def parse_iso_datetime(value):
     if not value:
         return None
@@ -155,6 +187,89 @@ def parse_iso_datetime(value):
         return datetime.fromisoformat(text)
     except ValueError:
         return None
+
+
+def run_command(args, timeout=30):
+    completed = subprocess.run(
+        list(args),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+    if completed.returncode != 0:
+        message = completed.stderr.strip() or completed.stdout.strip() or 'command failed'
+        raise RuntimeError(message)
+    return completed.stdout.strip()
+
+
+def detect_git_repo_root():
+    script_dir = Path(__file__).resolve().parent
+    try:
+        output = run_command(['git', '-C', str(script_dir), 'rev-parse', '--show-toplevel'], timeout=10)
+    except Exception:
+        return None
+    repo_root = Path(output).expanduser()
+    return repo_root if repo_root.is_dir() else None
+
+
+def maybe_self_update():
+    if not auto_update_enabled():
+        return
+
+    state = read_json_file(DEFAULT_UPDATE_STATE_FILE) or {}
+    last_checked = parse_iso_datetime(state.get('lastCheckedAt'))
+    now = datetime.now(timezone.utc)
+    if last_checked and (now - last_checked).total_seconds() < DEFAULT_UPDATE_INTERVAL_SECONDS:
+        return
+
+    repo_root = detect_git_repo_root()
+    next_state = {
+        'lastCheckedAt': now.isoformat(),
+        'updatedAt': str(state.get('updatedAt') or ''),
+    }
+
+    if not repo_root:
+        next_state['status'] = 'skipped'
+        next_state['reason'] = 'not_git_checkout'
+        write_json_file(DEFAULT_UPDATE_STATE_FILE, next_state)
+        return
+
+    try:
+        worktree_status = run_command(
+            ['git', '-C', str(repo_root), 'status', '--porcelain', '--untracked-files=no'],
+            timeout=10,
+        )
+        if worktree_status.strip():
+            next_state['status'] = 'skipped'
+            next_state['reason'] = 'worktree_dirty'
+            write_json_file(DEFAULT_UPDATE_STATE_FILE, next_state)
+            return
+
+        upstream = run_command(
+            ['git', '-C', str(repo_root), 'rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'],
+            timeout=10,
+        )
+        remote_name = upstream.split('/', 1)[0]
+        local_head = run_command(['git', '-C', str(repo_root), 'rev-parse', 'HEAD'], timeout=10)
+        run_command(['git', '-C', str(repo_root), 'fetch', '--quiet', remote_name], timeout=60)
+        upstream_head = run_command(['git', '-C', str(repo_root), 'rev-parse', '@{u}'], timeout=10)
+
+        if local_head == upstream_head:
+            next_state['status'] = 'up_to_date'
+            write_json_file(DEFAULT_UPDATE_STATE_FILE, next_state)
+            return
+
+        run_command(['git', '-C', str(repo_root), 'pull', '--ff-only', '--quiet'], timeout=90)
+        next_state['status'] = 'updated'
+        next_state['updatedAt'] = datetime.now(timezone.utc).isoformat()
+        next_state['repoRoot'] = str(repo_root)
+    except Exception as exc:
+        next_state['status'] = 'error'
+        next_state['error'] = str(exc)
+
+    write_json_file(DEFAULT_UPDATE_STATE_FILE, next_state)
 
 
 def read_error_message(exc):
@@ -564,7 +679,7 @@ def fetch_recent_captures(api_base_url, access_token, count, stale_threshold, so
     captures = list_captures(api_base_url, access_token, max(DEFAULT_FETCH_LIMIT, count * 8), source_id)
     selected, selected_source_id = choose_captures(captures, count, source_id)
     if not selected:
-        raise RuntimeError('No captures found in VCapture. Please verify VCapture is running and capturing.')
+        raise NoCapturesError('No captures found in VCapture. Please verify VCapture is running and capturing.')
 
     prepare_output_dir()
     now = datetime.now(timezone.utc)
@@ -632,6 +747,8 @@ def main():
     count = max(1, min(10, int(args.count or DEFAULT_COUNT)))
     stale_threshold = max(1, int(args.stale_threshold or DEFAULT_STALE_THRESHOLD))
 
+    maybe_self_update()
+
     access_token, token_source = get_access_token(args.access_token, args.access_token_file)
 
     try:
@@ -655,11 +772,20 @@ def main():
             'message': f'VCapture API {exc.status_code}: {exc}',
         }))
         sys.exit(1)
-    except Exception as exc:
-        print(json.dumps({
+    except NoCapturesError as exc:
+        print(json.dumps(attach_download_links({
             'status': 'error',
             'message': str(exc),
-        }))
+        }), indent=2))
+        sys.exit(1)
+    except Exception as exc:
+        payload = {
+            'status': 'error',
+            'message': str(exc),
+        }
+        if 'No captures found' in str(exc):
+            payload = attach_download_links(payload)
+        print(json.dumps(payload, indent=2))
         sys.exit(1)
 
 
