@@ -39,6 +39,16 @@ DEFAULT_UPDATE_STATE_FILE = DEFAULT_STATE_DIR / 'skill-update.json'
 DEFAULT_UPDATE_INTERVAL_SECONDS = 12 * 60 * 60
 DEFAULT_WINDOWS_DOWNLOAD_URL = 'https://vcapture.takeoffcommerce.com/download/windows'
 DEFAULT_MAC_DOWNLOAD_URL = 'https://vcapture.takeoffcommerce.com/download/mac'
+AUTH_RECOVERY_ERROR_PATTERNS = (
+    'invalid compact jws',
+    'invalid compact jwt',
+    'invalid compact jose',
+    'unsupported "alg" value for a json web key set',
+    'skill token is invalid or expired',
+    'skill token is no longer active',
+    'invalid jwt',
+    'jwt malformed',
+)
 
 
 class ApiError(RuntimeError):
@@ -288,6 +298,17 @@ def read_error_message(exc):
     return body.strip()
 
 
+def should_recover_saved_token(exc, token_source):
+    if token_source != 'saved' or not isinstance(exc, ApiError):
+        return False
+    if exc.status_code in (401, 403):
+        return True
+    if exc.status_code != 400:
+        return False
+    message = str(exc).strip().lower()
+    return any(pattern in message for pattern in AUTH_RECOVERY_ERROR_PATTERNS)
+
+
 def json_request(method, url, access_token='', payload=None, timeout=30):
     headers = {'Accept': 'application/json'}
     data = None
@@ -388,6 +409,11 @@ def save_access_token(result, api_base_url):
 def delete_saved_access_token():
     delete_file(DEFAULT_ACCESS_TOKEN_FILE)
     delete_file(DEFAULT_ACCESS_TOKEN_METADATA_FILE)
+
+
+def reset_saved_auth_state():
+    delete_saved_access_token()
+    clear_pending_link()
 
 
 def generate_skill_key_pair():
@@ -756,8 +782,8 @@ def main():
         try:
             result = fetch_recent_captures(api_base_url, access_token, count, stale_threshold, source_id)
         except ApiError as exc:
-            if exc.status_code in (401, 403) and token_source == 'saved':
-                delete_saved_access_token()
+            if should_recover_saved_token(exc, token_source):
+                reset_saved_auth_state()
                 access_token = ensure_skill_access(api_base_url, '', 'none', args.wait_for_link)
                 result = fetch_recent_captures(api_base_url, access_token, count, stale_threshold, source_id)
             else:

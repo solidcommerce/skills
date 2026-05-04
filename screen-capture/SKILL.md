@@ -10,6 +10,7 @@ Use this skill to fetch the latest VCapture screenshots and inspect what the use
 VCapture captures on the desktop app, encrypts locally, uploads to the hosted API, and this skill decrypts locally after account-link succeeds.
 
 Do not read Azure Blob directly. Do not ask for storage keys.
+Do not inspect this script or invent auth workarounds for end users unless the normal reconnect flow fails twice.
 
 ## Run
 
@@ -28,6 +29,7 @@ python3 scripts/fetch_captures.py
 ## What happens
 
 - If the skill is already linked, it downloads the latest captures to `/tmp/screen-captures/`.
+- If the saved link is stale or invalid, the script automatically clears it and starts a fresh hosted reconnect flow.
 - If the skill is not linked, it returns `authorization_required` with an `authorize_url`.
 - Open that URL, sign in once, finish the connection page, then rerun the script.
 
@@ -60,9 +62,11 @@ Saved local state:
 ## Failure handling
 
 - If you get `authorization_required`, ask the user to open the returned `authorize_url`.
+- If the script returns a token or auth error, rerun the same command once. The script should automatically convert stale saved auth into `authorization_required`.
 - If the page says the account is approved but the skill is still waiting, keep the VCapture desktop app open for a few seconds and rerun.
 - If the script says no captures were found, it now also returns Windows and Mac download links for the desktop app.
 - If the captures are stale, tell the user VCapture may not be running or capturing.
+- Do not create fake token files, pass blank tokens, or probe the code as a first response. For end users, the correct path is reconnect and retry.
 
 ## Auto-update
 
