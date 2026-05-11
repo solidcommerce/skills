@@ -110,6 +110,17 @@ def b64url_decode(value, label='value'):
 
 def ensure_state_dir():
     DEFAULT_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(DEFAULT_STATE_DIR, 0o700)
+    except OSError:
+        pass
+
+
+def restrict_file_perms(path):
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
 
 
 def read_text_file(path_value):
@@ -395,6 +406,7 @@ def save_access_token(result, api_base_url):
         raise RuntimeError('VCapture API did not return a skill token.')
     ensure_state_dir()
     DEFAULT_ACCESS_TOKEN_FILE.write_text(f'{token}\n', encoding='utf-8')
+    restrict_file_perms(DEFAULT_ACCESS_TOKEN_FILE)
     write_json_file(DEFAULT_ACCESS_TOKEN_METADATA_FILE, {
       'apiBaseUrl': api_base_url,
       'tokenType': str(result.get('tokenType') or 'Bearer'),
@@ -403,6 +415,7 @@ def save_access_token(result, api_base_url):
       'permissions': list(result.get('permissions') or []),
       'label': str(result.get('label') or 'VCapture screen-capture skill'),
     })
+    restrict_file_perms(DEFAULT_ACCESS_TOKEN_METADATA_FILE)
     return token
 
 
@@ -441,6 +454,7 @@ def save_content_key(content_key, api_base_url):
         'apiBaseUrl': api_base_url,
     }
     DEFAULT_CONTENT_KEY_FILE.write_text(f'{json.dumps(payload, indent=2)}\n', encoding='utf-8')
+    restrict_file_perms(DEFAULT_CONTENT_KEY_FILE)
     return payload
 
 
@@ -533,6 +547,7 @@ def load_pending_link():
 
 def save_pending_link(payload):
     write_json_file(DEFAULT_LINK_SESSION_FILE, payload)
+    restrict_file_perms(DEFAULT_LINK_SESSION_FILE)
 
 
 def clear_pending_link():
