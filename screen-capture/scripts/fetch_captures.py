@@ -2,8 +2,12 @@
 """Fetch the latest screen captures from the VCapture control-plane API."""
 
 import argparse
+import getpass
+import hashlib
 import json
 import os
+import re
+import socket
 import subprocess
 import sys
 import time
@@ -25,20 +29,26 @@ except ImportError as exc:
     HKDF = None
     CRYPTO_IMPORT_ERROR = exc
 
-OUTPUT_DIR = Path('/tmp/screen-captures')
+LEGACY_STATE_DIR = Path.home() / '.config' / 'vcapture'
+DEFAULT_CONTAINER_STATE_ROOT = Path('/tmp') / 'vcapture-screen-capture-state'
+DEFAULT_HOST_STATE_ROOT = LEGACY_STATE_DIR / 'screen-capture'
+DEFAULT_OUTPUT_ROOT = Path('/tmp') / 'vcapture-screen-captures'
+OUTPUT_DIR = None
 DEFAULT_API_BASE_URL = 'https://vcapture.takeoffcommerce.com'
 DEFAULT_STALE_THRESHOLD = 60
 DEFAULT_COUNT = 2
 DEFAULT_FETCH_LIMIT = 20
-DEFAULT_STATE_DIR = Path.home() / '.config' / 'vcapture'
-DEFAULT_ACCESS_TOKEN_FILE = DEFAULT_STATE_DIR / 'skill-token'
-DEFAULT_ACCESS_TOKEN_METADATA_FILE = DEFAULT_STATE_DIR / 'skill-token.json'
-DEFAULT_CONTENT_KEY_FILE = DEFAULT_STATE_DIR / 'content-key.json'
-DEFAULT_LINK_SESSION_FILE = DEFAULT_STATE_DIR / 'skill-link.json'
-DEFAULT_UPDATE_STATE_FILE = DEFAULT_STATE_DIR / 'skill-update.json'
+DEFAULT_STATE_DIR = None
+DEFAULT_ACCESS_TOKEN_FILE = None
+DEFAULT_ACCESS_TOKEN_METADATA_FILE = None
+DEFAULT_CONTENT_KEY_FILE = None
+DEFAULT_LINK_SESSION_FILE = None
+DEFAULT_UPDATE_STATE_FILE = None
 DEFAULT_UPDATE_INTERVAL_SECONDS = 12 * 60 * 60
 DEFAULT_WINDOWS_DOWNLOAD_URL = 'https://vcapture.takeoffcommerce.com/download/windows'
 DEFAULT_MAC_DOWNLOAD_URL = 'https://vcapture.takeoffcommerce.com/download/mac'
+ISOLATION_CONTEXT_ID = ''
+CONTAINER_ID_PATTERN = re.compile(r'[0-9a-f]{64}', re.IGNORECASE)
 AUTH_RECOVERY_ERROR_PATTERNS = (
     'invalid compact jws',
     'invalid compact jwt',
@@ -79,6 +89,163 @@ def get_env(*names):
     return ''
 
 
+def read_small_text(path_value, limit=8192):
+    try:
+        return Path(path_value).read_text(encoding='utf-8', errors='ignore')[:limit]
+    except OSError:
+        return ''
+
+
+def sanitize_context_id(value):
+    text = str(value or '').strip()
+    text = re.sub(r'[^A-Za-z0-9._-]+', '-', text).strip('.-_')
+    return text[:80]
+
+
+def detect_container_id():
+    for path_value in ('/proc/self/cgroup', '/proc/1/cgroup'):
+        text = read_small_text(path_value)
+        matches = CONTAINER_ID_PATTERN.findall(text)
+        if matches:
+            return matches[-1].lower()
+    hostname = read_small_text('/etc/hostname', limit=256).strip().splitlines()
+    if hostname:
+        candidate = sanitize_context_id(hostname[0])
+        if len(candidate) >= 12:
+            return candidate.lower()
+    return ''
+
+
+def is_running_in_container():
+    if Path('/.dockerenv').exists() or Path('/run/.containerenv').exists():
+        return True
+    if get_env('KUBERNETES_SERVICE_HOST'):
+        return True
+    cgroup = read_small_text('/proc/self/cgroup').lower()
+    return any(marker in cgroup for marker in ('docker', 'kubepods', 'containerd', 'libpod', 'podman'))
+
+
+def read_namespace_link(name):
+    try:
+        return os.readlink(f'/proc/self/ns/{name}')
+    except OSError:
+        return ''
+
+
+def get_current_user_name():
+    try:
+        return getpass.getuser()
+    except Exception:
+        return str(os.geteuid())
+
+
+def derive_isolation_context_id(cli_value=''):
+    explicit = cli_value or get_env(
+        'VCAPTURE_CONTEXT_ID',
+        'AVCAPTURE_CONTEXT_ID',
+        'VCAPTURE_STATE_CONTEXT',
+        'AVCAPTURE_STATE_CONTEXT',
+    )
+    explicit = sanitize_context_id(explicit)
+    if explicit:
+        return explicit
+
+    parts = [
+        f'uid={os.geteuid()}',
+        f'user={get_current_user_name()}',
+        f'home={Path.home()}',
+        f'hostname={socket.gethostname()}',
+        f'container={detect_container_id()}',
+        f'codex_home={get_env("CODEX_HOME")}',
+        f'claude_config={get_env("CLAUDE_CONFIG_DIR")}',
+    ]
+    for namespace in ('mnt', 'pid', 'user', 'uts'):
+        parts.append(f'ns:{namespace}={read_namespace_link(namespace)}')
+    digest = hashlib.sha256('\n'.join(parts).encode('utf-8')).hexdigest()[:24]
+    return f'ctx-{digest}'
+
+
+def resolve_configured_path(cli_value, *env_names):
+    value = cli_value or get_env(*env_names)
+    if not value:
+        return None
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return path
+
+
+def resolve_state_dir(cli_value, context_id):
+    configured = resolve_configured_path(cli_value, 'VCAPTURE_STATE_DIR', 'AVCAPTURE_STATE_DIR')
+    if configured:
+        return configured
+
+    configured_root = resolve_configured_path('', 'VCAPTURE_STATE_ROOT', 'AVCAPTURE_STATE_ROOT')
+    if configured_root:
+        return configured_root / context_id
+
+    if is_running_in_container():
+        runtime_root = resolve_configured_path('', 'XDG_RUNTIME_DIR')
+        if runtime_root and runtime_root.is_dir() and os.access(runtime_root, os.W_OK | os.X_OK):
+            return runtime_root / 'vcapture-screen-capture' / 'state' / context_id
+        return DEFAULT_CONTAINER_STATE_ROOT / context_id
+
+    return DEFAULT_HOST_STATE_ROOT / context_id
+
+
+def resolve_output_dir(cli_value, context_id):
+    configured = resolve_configured_path(cli_value, 'VCAPTURE_OUTPUT_DIR', 'AVCAPTURE_OUTPUT_DIR')
+    if configured:
+        return configured
+
+    configured_root = resolve_configured_path('', 'VCAPTURE_OUTPUT_ROOT', 'AVCAPTURE_OUTPUT_ROOT')
+    if configured_root:
+        return configured_root / context_id
+
+    return DEFAULT_OUTPUT_ROOT / context_id
+
+
+def configure_paths(state_dir='', output_dir='', context_id=''):
+    global DEFAULT_STATE_DIR
+    global DEFAULT_ACCESS_TOKEN_FILE
+    global DEFAULT_ACCESS_TOKEN_METADATA_FILE
+    global DEFAULT_CONTENT_KEY_FILE
+    global DEFAULT_LINK_SESSION_FILE
+    global DEFAULT_UPDATE_STATE_FILE
+    global OUTPUT_DIR
+    global ISOLATION_CONTEXT_ID
+
+    ISOLATION_CONTEXT_ID = derive_isolation_context_id(context_id)
+    DEFAULT_STATE_DIR = resolve_state_dir(state_dir, ISOLATION_CONTEXT_ID)
+    DEFAULT_ACCESS_TOKEN_FILE = DEFAULT_STATE_DIR / 'skill-token'
+    DEFAULT_ACCESS_TOKEN_METADATA_FILE = DEFAULT_STATE_DIR / 'skill-token.json'
+    DEFAULT_CONTENT_KEY_FILE = DEFAULT_STATE_DIR / 'content-key.json'
+    DEFAULT_LINK_SESSION_FILE = DEFAULT_STATE_DIR / 'skill-link.json'
+    DEFAULT_UPDATE_STATE_FILE = DEFAULT_STATE_DIR / 'skill-update.json'
+    OUTPUT_DIR = resolve_output_dir(output_dir, ISOLATION_CONTEXT_ID)
+
+
+def ensure_runtime_paths():
+    if DEFAULT_STATE_DIR is None or OUTPUT_DIR is None:
+        configure_paths()
+
+
+def runtime_context_payload():
+    ensure_runtime_paths()
+    return {
+        'context_id': ISOLATION_CONTEXT_ID,
+        'state_dir': str(DEFAULT_STATE_DIR),
+        'output_dir': str(OUTPUT_DIR),
+        'containerized': is_running_in_container(),
+    }
+
+
+def attach_runtime_context(payload):
+    next_payload = dict(payload or {})
+    next_payload['runtime'] = runtime_context_payload()
+    return next_payload
+
+
 def require_crypto():
     if CRYPTO_IMPORT_ERROR is not None:
         raise RuntimeError(
@@ -109,6 +276,7 @@ def b64url_decode(value, label='value'):
 
 
 def ensure_state_dir():
+    ensure_runtime_paths()
     DEFAULT_STATE_DIR.mkdir(parents=True, exist_ok=True)
     try:
         os.chmod(DEFAULT_STATE_DIR, 0o700)
@@ -142,6 +310,7 @@ def read_json_file(path):
 def write_json_file(path, payload):
     ensure_state_dir()
     path.write_text(f'{json.dumps(payload, indent=2)}\n', encoding='utf-8')
+    restrict_file_perms(path)
 
 
 def delete_file(path):
@@ -152,6 +321,7 @@ def delete_file(path):
 
 
 def get_access_token(cli_value, cli_file_value):
+    ensure_runtime_paths()
     if cli_value:
         return str(cli_value).strip(), 'cli'
     file_value = cli_file_value or get_env('VCAPTURE_ACCESS_TOKEN_FILE', 'AVCAPTURE_ACCESS_TOKEN_FILE')
@@ -194,7 +364,7 @@ def attach_download_links(payload):
 def auto_update_enabled():
     value = get_env('VCAPTURE_SKILL_AUTO_UPDATE', 'AVCAPTURE_SKILL_AUTO_UPDATE')
     if not value:
-        return True
+        return not is_running_in_container()
     return str(value).strip().lower() not in {'0', 'false', 'no', 'off'}
 
 
@@ -567,14 +737,14 @@ def build_authorization_payload(payload, resumed=False):
         message = 'Finish the open VCapture connection flow, then retry the screen-capture request.'
     else:
         message = 'Open authorizeUrl to connect VCapture, then retry the screen-capture request.'
-    return {
+    return attach_runtime_context({
         'status': 'authorization_required',
         'message': message,
         'authorize_url': authorize_url,
         'link_code': link_code,
         'expires_at': expires_at,
         'poll_after_seconds': 5,
-    }
+    })
 
 
 def start_link_session(api_base_url):
@@ -710,7 +880,12 @@ def issue_read_url(api_base_url, access_token, capture_id):
 
 
 def prepare_output_dir():
+    ensure_runtime_paths()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(OUTPUT_DIR, 0o700)
+    except OSError:
+        pass
     for pattern in ('capture_*.jpg', 'capture_*.png', 'capture_*.webp', 'capture_*.bmp'):
         for old_file in OUTPUT_DIR.glob(pattern):
             old_file.unlink()
@@ -738,11 +913,13 @@ def fetch_recent_captures(api_base_url, access_token, count, stale_threshold, so
         downloaded_bytes, content_type = download_bytes(read_url_response['url'])
         plaintext_bytes, plaintext_type = decrypt_capture_bytes(downloaded_bytes, capture)
         destination.write_bytes(plaintext_bytes)
+        restrict_file_perms(destination)
         actual_extension = preferred_extension(read_url_response['url'], plaintext_type or plaintext_type_hint or content_type)
         if actual_extension != destination.suffix:
             corrected_destination = destination.with_suffix(actual_extension)
             destination.rename(corrected_destination)
             destination = corrected_destination
+            restrict_file_perms(destination)
 
         captured_at = parse_iso_datetime(capture.get('capturedAt'))
         age_seconds = int((now - captured_at).total_seconds()) if captured_at else None
@@ -763,6 +940,7 @@ def fetch_recent_captures(api_base_url, access_token, count, stale_threshold, so
         'captures': downloaded,
         'selected_source_id': selected_source_id,
         'stale': stale,
+        'runtime': runtime_context_payload(),
     }
     if stale:
         result['stale_message'] = (
@@ -781,7 +959,12 @@ def main():
     parser.add_argument('--access-token-file', default='', help='Path to a file containing the VCapture bearer token')
     parser.add_argument('--source-id', default='', help='Optional sourceId to restrict captures to one source')
     parser.add_argument('--wait-for-link', type=int, default=0, help='Seconds to wait for hosted account-link completion before returning authorization_required')
+    parser.add_argument('--state-dir', default='', help='Private directory for this user/container skill auth state')
+    parser.add_argument('--output-dir', default='', help='Private directory for decrypted capture output')
+    parser.add_argument('--context-id', default='', help='Stable per-user/per-container isolation id for default paths')
     args = parser.parse_args()
+
+    configure_paths(args.state_dir, args.output_dir, args.context_id)
 
     api_base_url = get_api_base_url(args.api_base_url)
     source_id = get_default_source_id(args.source_id)
@@ -808,16 +991,16 @@ def main():
         print(json.dumps(exc.payload, indent=2))
         sys.exit(2)
     except ApiError as exc:
-        print(json.dumps({
+        print(json.dumps(attach_runtime_context({
             'status': 'error',
             'message': f'VCapture API {exc.status_code}: {exc}',
-        }))
+        }), indent=2))
         sys.exit(1)
     except NoCapturesError as exc:
-        print(json.dumps(attach_download_links({
+        print(json.dumps(attach_runtime_context(attach_download_links({
             'status': 'error',
             'message': str(exc),
-        }), indent=2))
+        })), indent=2))
         sys.exit(1)
     except Exception as exc:
         payload = {
@@ -826,7 +1009,7 @@ def main():
         }
         if 'No captures found' in str(exc):
             payload = attach_download_links(payload)
-        print(json.dumps(payload, indent=2))
+        print(json.dumps(attach_runtime_context(payload), indent=2))
         sys.exit(1)
 
 
